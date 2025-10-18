@@ -45,7 +45,7 @@ for url in "${urls_to_process[@]}"; do
   log_file="$LOG_DIR/${playlist_name}_$(date +%y_%m_%d_%H%M).log"
   echo "Downloading $url to $BASE_DIR, logging to $log_file"
   # Run the downloader with less threads to avoid getting rate limited, filter unwanted warning, and log output
-{ python3 -u PY_DOWNLOADER  --threads 5 \
+{ python3 -u $PY_DOWNLOADER  --threads 5 \
     "$url" \
     "$BASE_DIR" \
     2> >(stdbuf -oL grep -v "Unable to download JSON metadata" >&2) ; } &> "$log_file"

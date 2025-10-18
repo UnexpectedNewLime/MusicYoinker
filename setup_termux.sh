@@ -5,6 +5,17 @@
 
 set -euo pipefail
 
+# --- Logging: capture stdout/stderr to a log file in the same directory as this script
+# You can override the filename by setting LOGFILE in the environment before running.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOGFILE="${LOGFILE:-setup.log}"
+# Use a timestamped file to avoid overwriting previous runs
+timestamp="$(date +%Y%m%d_%H%M%S)"
+LOGPATH="$script_dir/${LOGFILE%.log}_$timestamp.log"
+# Redirect stdout/stderr through tee so output still appears in the terminal
+exec > >(tee -a "$LOGPATH") 2>&1
+echo "Logging setup run to: $LOGPATH"
+
 SHORTCUTS_DIR="$HOME/.shortcuts"
 RUNNER_NAME="download_soundcloud.playlists.sh"
 RUNNER_SRC="${RUNNER_SRC:-./$RUNNER_NAME}"
