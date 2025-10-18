@@ -4,6 +4,9 @@ Usage
 -----
 Follow these steps to run the downloader from a phone with Termux and add it to the home-screen widget:
 
+Download Termux from the play store:
+https://play.google.com/store/apps/details?id=com.termux&hl=en_AU&pli=1
+
 1) Pull the repo on a phone with Termux installed
 
   In Termux:
@@ -17,21 +20,36 @@ cd MusicYoinker
 
 ```bash
 mv download_soundcloud.playlists.sh ~/.shortcuts/
+cd ~/.shortcuts/
 chmod +x ~/.shortcuts/download_soundcloud.playlists.sh
 ```
 
 3) Set environment variables (examples)
 
-  The script reads a playlists file and needs a base output directory and a log directory. Example environment variables you can set in your Termux shell or ~/.profile:
-
+  The script reads a playlists file and needs a base output directory and a log directory. Example environment variables you can set in your Termux shell or ~/.bashrc:
+  
 ```bash
 export PLAYLISTS_FILE="$HOME/playlists.txt"          # path to playlist file (required)
 export SOUNDCLOUD_BASE_DIR="$HOME/Music"  # where to store downloaded music
 export SOUNDCLOUD_LOG_DIR="$HOME/logs"               # where per-playlist logs go
 export PY_DOWNLOADER="$HOME/MusicYoinker/SoundCloud_Downloader.py"  # path to downloader script
 ```
+Add these to the end of of your .bashrc file via:
+```bash
+cd ~
+nano .bashrc
+```
 
-4) Add to the Termux home-screen widget
+3) Download the required dependencies
+
+  The script requires python3 and yt-dlp to work so they must be installed onto the device:
+  
+```bash
+pkg install python3 -y
+pkg install yt-dlp -y
+```
+
+5) Add to the Termux home-screen widget
 
   After moving the script into `~/.shortcuts` it should appear in the Termux shortcuts widget. Tap the script name to run it; the runner will read the file pointed to by `PLAYLISTS_FILE` and download each playlist to `SOUNDCLOUD_BASE_DIR`.
 
