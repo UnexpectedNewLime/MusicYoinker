@@ -40,7 +40,7 @@ cd ~
 nano .bashrc
 ```
 
-3) Download the required dependencies
+4) Download the required dependencies
 
   The script requires python3 and yt-dlp to work so they must be installed onto the device:
   
@@ -48,7 +48,7 @@ nano .bashrc
 pkg install python3 -y
 pkg install yt-dlp -y
 ```
-6) Create a playlists file:
+5) Create a playlists file:
    This is the file where playlists will be read from, ensure that the soundcloud playlist is public
 ```bash
 cd ~  #to create the playlist file at the location we defined in the env vars above PLAYLISTS_FILE
@@ -56,7 +56,7 @@ nano playlists.txt
 # once the nano window is open you can paste the playlists in to the file ensuring each playlist has its own line check playlists.txt in the repo for an example
 ```
     
-7) run via the Termux home-screen widget
+6) run via the Termux home-screen widget
 
   After moving the script into `~/.shortcuts` it should appear in the Termux shortcuts widget. Tap the script name to run it; the runner will read the file pointed to by `PLAYLISTS_FILE` and download each playlist to `SOUNDCLOUD_BASE_DIR`.
 
