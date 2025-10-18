@@ -1,14 +1,7 @@
-# Example playlists file for soundcloud_downloader.py
-# First meaningful line may start with `args` to set defaults for the run.
-# Format example: args --format mp3 --workers 4
+# Example playlists file for MusicYoinker
+# One SoundCloud playlist or track URL per line
+# Blank lines and lines starting with # are ignored
 
-args --format mp3 --workers 4
-
-# Single playlist URL (dummy/example)
+# Example:
 https://soundcloud.com/artist/sets/example-playlist-1
-
-# Another playlist URL
-https://soundcloud.com/another_artist/sets/example-playlist-2
-
-# Single track URL example
 https://soundcloud.com/artist/example-track
