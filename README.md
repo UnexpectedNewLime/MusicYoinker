@@ -16,7 +16,7 @@ cd MusicYoinker
 2) Move the runner into the Termux shortcuts directory (so it can be added to the Home-screen widget)
 
 ```bash
-mv download_soundcloud.playlists.sh ~/.shortcuts/download_soundcloud.playlists.sh
+mv download_soundcloud.playlists.sh ~/.shortcuts/
 chmod +x ~/.shortcuts/download_soundcloud.playlists.sh
 ```
 
@@ -28,7 +28,7 @@ chmod +x ~/.shortcuts/download_soundcloud.playlists.sh
 export PLAYLISTS_FILE="$HOME/playlists.txt"          # path to playlist file (required)
 export SOUNDCLOUD_BASE_DIR="$HOME/Music"  # where to store downloaded music
 export SOUNDCLOUD_LOG_DIR="$HOME/logs"               # where per-playlist logs go
-export PY_DOWNLOADER="$HOME/MusicYoinker/SoundCloud_Downloader.py"  # optional path to downloader script
+export PY_DOWNLOADER="$HOME/MusicYoinker/SoundCloud_Downloader.py"  # path to downloader script
 ```
 
 4) Add to the Termux home-screen widget
