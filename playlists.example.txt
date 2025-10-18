@@ -1,7 +1,0 @@
-# Example playlists file for MusicYoinker
-# One SoundCloud playlist or track URL per line
-# Blank lines and lines starting with # are ignored
-
-# Example:
-https://soundcloud.com/artist/sets/example-playlist-1
-https://soundcloud.com/artist/example-track

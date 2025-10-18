@@ -1,7 +1,7 @@
-# Example playlists file for soundcloud_downloader.py
+# Example playlists file for MusicYoinker
+# One SoundCloud playlist or track URL per line
+# Blank lines and lines starting with # are ignored
 
-# Example
+# Example:
 https://soundcloud.com/artist/sets/example-playlist-1
-
-# Another playlist URL
-https://soundcloud.com/another_artist/sets/example-playlist-2
+https://soundcloud.com/artist/example-track
