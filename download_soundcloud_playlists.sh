@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+source $HOME/.bashrc
+
 if [[ "$1" == "-h" || "$1" == "--help" ]]; then
   echo "Usage: $0 [BASE_DIR] [LOG_DIR]"
   echo "  BASE_DIR: Output directory for downloads (default: \$HOME/Music/SoundCloud or SOUNDCLOUD_BASE_DIR)"
