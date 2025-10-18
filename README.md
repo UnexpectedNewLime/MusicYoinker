@@ -56,7 +56,7 @@ nano playlists.txt
 # once the nano window is open you can paste the playlists in to the file ensuring each playlist has its own line check playlists.txt in the repo for an example
 ```
     
-5) Add to the Termux home-screen widget
+7) run via the Termux home-screen widget
 
   After moving the script into `~/.shortcuts` it should appear in the Termux shortcuts widget. Tap the script name to run it; the runner will read the file pointed to by `PLAYLISTS_FILE` and download each playlist to `SOUNDCLOUD_BASE_DIR`.
 
