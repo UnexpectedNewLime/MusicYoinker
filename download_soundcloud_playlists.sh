@@ -17,6 +17,8 @@ PLAYLISTS_FILE="${PLAYLISTS_FILE:-playlists.txt}"
 BASE_DIR="${SOUNDCLOUD_BASE_DIR:-${1:-$HOME/music}}"
 # Base log directory
 LOG_DIR="${SOUNDCLOUD_LOG_DIR:-${2:-$HOME/logs}}"
+# Delay between playlists (seconds) to avoid bursting SoundCloud with back-to-back requests
+PLAYLIST_DELAY_SECONDS="${SOUNDCLOUD_PLAYLIST_DELAY:-60}"
 mkdir -p "$BASE_DIR"
 mkdir -p "$LOG_DIR"
 echo "BASE_DIR: $BASE_DIR"
@@ -56,6 +58,11 @@ for url in "${urls_to_process[@]}"; do
   if (( ${#logs[@]} > 3 )); then
     to_remove=( "${logs[@]:3}" )
     printf '%s\n' "${to_remove[@]}" | xargs -r rm --
+  fi
+
+  if [[ "$url" != "${urls_to_process[-1]}" ]]; then
+    echo "Waiting ${PLAYLIST_DELAY_SECONDS}s before next playlist to avoid rate limiting..."
+    sleep "$PLAYLIST_DELAY_SECONDS"
   fi
 done
 
