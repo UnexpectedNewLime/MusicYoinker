@@ -318,53 +318,62 @@ def validate_directory(directory: str) -> str:
             raise
     return abs_path
 
-def get_playlist_tracks(url: str) -> List[str]:
+def extract_playlist_info(url: str, retries: int = 3, backoff_seconds: float = 5.0) -> Optional[Dict[str, Any]]:
     """
-    Extract individual track URLs from a playlist.
+    Fetch playlist metadata (title + flat entries) in a single yt-dlp call,
+    retrying with exponential backoff since SoundCloud intermittently
+    throttles the playlist-resolve request for large playlists.
     """
+    import time
     import yt_dlp
-    
+
     ydl_opts = {
         'extract_flat': True,
         'quiet': True,
     }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-            if 'entries' in info:
-                return [entry['url'] for entry in info['entries'] if entry.get('url')]
-            return []
-        except Exception as e:
-            logger.error(f"Failed to extract playlist info: {str(e)}")
-            return []
 
-def get_playlist_title(url: str) -> str:
+    for attempt in range(1, retries + 1):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info:
+                    return info
+                logger.warning(f"Playlist extraction returned no data (attempt {attempt}/{retries}), possibly rate limited")
+        except Exception as e:
+            logger.warning(f"Failed to extract playlist info (attempt {attempt}/{retries}): {str(e)}")
+
+        if attempt < retries:
+            sleep_time = backoff_seconds * (2 ** (attempt - 1))
+            logger.info(f"Retrying playlist extraction in {sleep_time:.0f}s...")
+            time.sleep(sleep_time)
+
+    logger.error("Failed to extract playlist info after all retries")
+    return None
+
+def get_playlist_tracks(info: Dict[str, Any]) -> List[str]:
     """
-    Extract the playlist title from the SoundCloud URL using yt-dlp.
+    Extract individual track URLs from already-fetched playlist info.
+    """
+    entries = info.get('entries') or []
+    return [entry['url'] for entry in entries if entry.get('url')]
+
+def get_playlist_title(info: Dict[str, Any]) -> str:
+    """
+    Extract the playlist title from already-fetched playlist info.
     Returns the playlist title as a string, or 'playlist' if not found.
     """
-    import yt_dlp
-    try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info.get('title', 'playlist')
-    except Exception as e:
-        logger.error(f"Failed to get playlist title: {str(e)}")
-        return 'playlist'
+    return info.get('title') or 'playlist'
 
-def download_playlist(url: str, output_dir: str, max_concurrent: int = MAX_CONCURRENT_DOWNLOADS, audio_format: str = 'mp3', progress_callback=None) -> None:
+def download_playlist(url: str, output_dir: str, track_urls: List[str], max_concurrent: int = MAX_CONCURRENT_DOWNLOADS, audio_format: str = 'mp3', progress_callback=None) -> None:
     """
     Download a SoundCloud playlist using yt-dlp with concurrent downloads.
     """
     import yt_dlp
-    
+
     # Get existing songs before starting download
     existing_songs = get_existing_songs(output_dir)
     logger.info(f"Found {len(existing_songs)} existing songs in the output directory")
-    
-    # Get all track URLs from the playlist
-    track_urls = get_playlist_tracks(url)
+
     if not track_urls:
         logger.error("No tracks found in playlist or failed to extract track information")
         return
@@ -497,18 +506,29 @@ def main() -> None:
             logger.error("Invalid SoundCloud URL provided")
             sys.exit(1)
         
-        # Get playlist title and create subfolder
-        playlist_title = get_playlist_title(args.url)
+        # Fetch playlist metadata once (title + track list) to avoid duplicate requests
+        playlist_info = extract_playlist_info(args.url)
+        if not playlist_info:
+            logger.error("Could not retrieve playlist information (possibly rate limited). Aborting.")
+            sys.exit(1)
+
+        playlist_title = get_playlist_title(playlist_info)
+        track_urls = get_playlist_tracks(playlist_info)
+        if not track_urls:
+            logger.error("No tracks found in playlist or failed to extract track information")
+            sys.exit(1)
+        logger.info(f"Found {len(track_urls)} tracks in playlist")
+
         safe_title = playlist_title.replace(os.sep, '_').replace(' ', '_')
         output_dir = os.path.join(validate_directory(args.output_dir), safe_title)
         output_dir = validate_directory(output_dir)
-        
+
         # Check for dependencies
         check_ffmpeg()
         check_and_install_yt_dlp()
-        
+
         # Download the playlist
-        download_playlist(args.url, output_dir, MAX_CONCURRENT_DOWNLOADS, args.format)
+        download_playlist(args.url, output_dir, track_urls, MAX_CONCURRENT_DOWNLOADS, args.format)
         
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
