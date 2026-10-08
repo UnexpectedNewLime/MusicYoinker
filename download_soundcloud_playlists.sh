@@ -59,6 +59,11 @@ sorted=$(
     printf '%s\t%s\n' "${pct:-100.0}" "$url"
   done | LC_ALL=C sort -s -t $'\t' -k1,1nr
 )
+# Guard the empty case: a here-string of "" would yield one empty URL
+if [[ -z "$sorted" ]]; then
+  echo "No playlist URLs found in $PLAYLISTS_FILE. Nothing to do."
+  exit 0
+fi
 echo "Playlist order (most missing first):"
 awk -F'\t' '{printf "  %5s%% missing  %s\n", $1, $2}' <<< "$sorted"
 mapfile -t urls_to_process < <(cut -f2 <<< "$sorted")

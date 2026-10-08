@@ -111,7 +111,7 @@ def note_request_result(got_403: bool) -> None:
             logger.warning(f"Got {count} HTTP 403s in a row, but a probe request succeeded; treating them as inaccessible tracks and continuing.")
             consecutive_403s = 0
 
-# Base-dir file mapping playlist URL -> {folder, total} from the last successful fetch,
+# Base-dir file mapping playlist URL -> {folder, total, ids} from the last successful fetch,
 # so the runner can order playlists by how much is missing without any API calls
 INDEX_FILENAME = '.playlist_index.json'
 
@@ -247,12 +247,12 @@ def load_playlist_index(base_dir: str) -> Dict[str, Dict[str, Any]]:
     except (OSError, ValueError):
         return {}
 
-def update_playlist_index(base_dir: str, url: str, folder: str, total: int) -> None:
+def update_playlist_index(base_dir: str, url: str, folder: str, track_ids: List[str]) -> None:
     """
-    Record a playlist's folder and track count after a successful fetch.
+    Record a playlist's folder and current track IDs after a successful fetch.
     """
     index = load_playlist_index(base_dir)
-    index[url] = {'folder': folder, 'total': total}
+    index[url] = {'folder': folder, 'total': len(track_ids), 'ids': track_ids}
     index_path = os.path.join(base_dir, INDEX_FILENAME)
     tmp_path = index_path + '.tmp'
     with open(tmp_path, 'w', encoding='utf-8') as f:
@@ -267,8 +267,15 @@ def get_missing_percent(url: str, base_dir: str) -> float:
     entry = load_playlist_index(base_dir).get(url)
     if not entry or not entry.get('total'):
         return 100.0
-    downloaded = len(load_archive(os.path.join(base_dir, entry['folder'])))
-    return max(0.0, 100.0 * (entry['total'] - downloaded) / entry['total'])
+    archived = load_archive(os.path.join(base_dir, entry['folder']))
+    ids = entry.get('ids')
+    if ids:
+        # Only count archived tracks that are still in the playlist, so removed or
+        # replaced tracks don't make the playlist look more complete than it is
+        missing = sum(1 for track_id in ids if f"soundcloud {track_id}" not in archived)
+        return 100.0 * missing / len(ids)
+    # Index entries written before IDs were stored: approximate until the next fetch
+    return max(0.0, 100.0 * (entry['total'] - len(archived)) / entry['total'])
 
 def download_track_by_url(url: str, output_dir: str, ydl_opts: Dict[str, Any]) -> bool:
     """
@@ -646,7 +653,7 @@ def main() -> None:
         safe_title = playlist_title.replace(os.sep, '_').replace(' ', '_')
         base_dir = validate_directory(args.output_dir)
         output_dir = validate_directory(os.path.join(base_dir, safe_title))
-        update_playlist_index(base_dir, args.url, safe_title, len(tracks))
+        update_playlist_index(base_dir, args.url, safe_title, [t['id'] for t in tracks])
 
         # Check for dependencies
         check_ffmpeg()
