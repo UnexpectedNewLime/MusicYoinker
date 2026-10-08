@@ -219,22 +219,44 @@ def download_progress_hook(d: dict, existing_songs: Set[str], output_dir: str, p
 
 def load_archive(output_dir: str) -> Set[str]:
     """
-    Load the set of track IDs already downloaded into this directory.
-    Lines use yt-dlp's download-archive format: "soundcloud <track id>".
+    Load the IDs of tracks already downloaded into this directory whose file is still there.
+    Lines are "soundcloud <track id>\t<filename>"; a track whose file was deleted or moved
+    is left out so it gets downloaded again. Older lines without a filename can't be
+    verified and are trusted.
     """
     archive_path = os.path.join(output_dir, ARCHIVE_FILENAME)
     if not os.path.exists(archive_path):
         return set()
+    files: Dict[str, Optional[str]] = {}
     with open(archive_path, encoding='utf-8') as f:
-        return {line.strip() for line in f if line.strip()}
+        for line in f:
+            key, _, filename = line.rstrip('\n').partition('\t')
+            parts = key.split()
+            if len(parts) == 2:
+                # Later lines win, e.g. a track re-downloaded after its file went missing
+                files[parts[1]] = filename or None
+    return {track_id for track_id, filename in files.items()
+            if filename is None or os.path.exists(os.path.join(output_dir, filename))}
 
-def record_in_archive(output_dir: str, track_id: str) -> None:
+def record_in_archive(output_dir: str, track_id: str, filename: Optional[str]) -> None:
     """
-    Append a track ID to the directory's archive so later runs skip it without an API call.
+    Append a track ID (and its file, when known) to the directory's archive so later runs
+    skip it without an API call.
     """
+    line = f"soundcloud {track_id}\t{filename}\n" if filename else f"soundcloud {track_id}\n"
     with archive_lock:
         with open(os.path.join(output_dir, ARCHIVE_FILENAME), 'a', encoding='utf-8') as f:
-            f.write(f"soundcloud {track_id}\n")
+            f.write(line)
+
+def find_existing_file(output_dir: str, title: str) -> Optional[str]:
+    """
+    Find the audio file in output_dir whose name matches a track title (case-insensitive).
+    """
+    for file in os.listdir(output_dir):
+        stem, ext = os.path.splitext(file)
+        if ext in ('.mp3', '.opus', '.m4a') and stem.lower() == title.lower():
+            return file
+    return None
 
 def load_playlist_index(base_dir: str) -> Dict[str, Dict[str, Any]]:
     """
@@ -272,29 +294,33 @@ def get_missing_percent(url: str, base_dir: str) -> float:
     if ids:
         # Only count archived tracks that are still in the playlist, so removed or
         # replaced tracks don't make the playlist look more complete than it is
-        missing = sum(1 for track_id in ids if f"soundcloud {track_id}" not in archived)
+        missing = sum(1 for track_id in ids if track_id not in archived)
         return 100.0 * missing / len(ids)
     # Index entries written before IDs were stored: approximate until the next fetch
     return max(0.0, 100.0 * (entry['total'] - len(archived)) / entry['total'])
 
-def download_track_by_url(url: str, output_dir: str, ydl_opts: Dict[str, Any]) -> bool:
+def download_track_by_url(url: str, output_dir: str, ydl_opts: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """
     Download a single track by URL.
-    Returns True if download was successful (or skipped by match_filter), False otherwise.
+    Returns (success, filename of the final audio file). Success is also True when
+    match_filter skipped the download; the filename is then None.
     """
     import yt_dlp
     try:
         # Raise on errors (instead of ignoreerrors) so 403s can be detected
         with yt_dlp.YoutubeDL({**ydl_opts, 'ignoreerrors': False}) as ydl:
-            ydl.download([url])
+            info = ydl.extract_info(url, download=True)
         note_request_result(got_403=False)
-        return True
+        # After post-processing, filepath points at the converted audio file
+        downloads = (info or {}).get('requested_downloads') or []
+        filepath = downloads[0].get('filepath') if downloads else None
+        return True, os.path.basename(filepath) if filepath else None
     except Exception as e:
         note_request_result(got_403=is_rate_limit_error(e))
         # yt-dlp has already logged its own DownloadErrors through our logger
         if not isinstance(e, yt_dlp.utils.DownloadError):
             logger.error(f"Failed to download {url}: {str(e)}")
-        return False
+        return False, None
 
 def download_single_track(track: Dict[str, str], output_dir: str, existing_songs: Set[str], ydl_opts: Dict[str, Any]) -> bool:
     """
@@ -305,9 +331,13 @@ def download_single_track(track: Dict[str, str], output_dir: str, existing_songs
     matches a file already in output_dir, match_filter skips the actual download.
     Either way the track ID is recorded in the archive so future runs skip it for free.
     """
+    skipped_title = None
+
     def skip_if_exists(info: Dict[str, Any], *, incomplete: bool = False) -> Optional[str]:
+        nonlocal skipped_title
         title = info.get('title') or ''
         if title.lower() in existing_songs:
+            skipped_title = title
             logger.info(f"Skipping existing track: {title}")
             return f"{title} already exists"
         return None
@@ -316,9 +346,11 @@ def download_single_track(track: Dict[str, str], output_dir: str, existing_songs
     if rate_limited.is_set():
         return False
 
-    success = download_track_by_url(track['url'], output_dir, {**ydl_opts, 'match_filter': skip_if_exists})
+    success, filename = download_track_by_url(track['url'], output_dir, {**ydl_opts, 'match_filter': skip_if_exists})
     if success:
-        record_in_archive(output_dir, track['id'])
+        if filename is None and skipped_title:
+            filename = find_existing_file(output_dir, skipped_title)
+        record_in_archive(output_dir, track['id'], filename)
     return success
 
 def check_ffmpeg() -> None:
@@ -496,7 +528,7 @@ def download_playlist(url: str, output_dir: str, tracks: List[Dict[str, str]], m
 
     total_tracks = len(tracks)
     archived = load_archive(output_dir)
-    pending = [t for t in tracks if f"soundcloud {t['id']}" not in archived]
+    pending = [t for t in tracks if t['id'] not in archived]
     already_done = total_tracks - len(pending)
     logger.info(f"Found {total_tracks} tracks in playlist; {already_done} already downloaded (no API call needed), {len(pending)} to process")
     
