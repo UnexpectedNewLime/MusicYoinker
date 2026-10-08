@@ -18,6 +18,7 @@ Date: 17/05/2025
 import os
 import sys
 import json
+import random
 import logging
 import subprocess
 import argparse
@@ -55,9 +56,12 @@ probing_rate_limit = False
 rate_limit_lock = Lock()
 rate_limited = Event()
 # URLs used to tell throttling apart from 403s on individual tracks that are simply
-# inaccessible (e.g. private): a track known to be accessible (last successful one, or one
-# downloaded on an earlier run), falling back to the playlist itself
+# inaccessible (e.g. private): the last track that succeeded in this run, tracks downloaded
+# on earlier runs (which may have since become inaccessible, hence several are tried),
+# falling back to the playlist itself
+MAX_PROBES = 3
 probe_track_url: Optional[str] = None
+probe_archived_urls: List[str] = []
 probe_playlist_url: Optional[str] = None
 
 class RateLimitedError(Exception):
@@ -68,25 +72,30 @@ def is_rate_limit_error(e: BaseException) -> bool:
 
 def is_throttled() -> bool:
     """
-    Re-request something known to be accessible. A 403 there means SoundCloud is throttling
-    us as a whole; success means the preceding 403s were for individual inaccessible tracks.
-    Prefers a full (non-flat) extraction of a known-good track, which hits the same track
-    metadata and stream endpoints as a download (minus the media itself); the flat playlist
-    request is only a fallback since it skips those endpoints.
-    Any failure to probe is treated as throttling, to err on the side of backing off.
+    Re-request things expected to be accessible. Any success means the preceding 403s were
+    for individual inaccessible tracks; if every probe fails, SoundCloud is throttling us.
+    Probes are full (non-flat) extractions of tracks, which hit the same track metadata and
+    stream endpoints as a download (minus the media itself): first the last track confirmed
+    in this run, then a random sample of tracks archived on earlier runs (any one of which
+    may have since become inaccessible). The flat playlist request is only a fallback since
+    it skips those endpoints.
     """
     import yt_dlp
-    url, opts = probe_track_url, {'quiet': True}
-    if not url:
-        url, opts = probe_playlist_url, {'extract_flat': True, 'quiet': True}
-    if not url:
-        return True
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return not ydl.extract_info(url, download=False)
-    except Exception as e:
-        logger.debug(f"Rate-limit probe failed: {type(e).__name__}: {e}")
-        return True
+    candidates = [probe_track_url] if probe_track_url else []
+    others = [u for u in probe_archived_urls if u != probe_track_url]
+    candidates += random.sample(others, min(len(others), MAX_PROBES - len(candidates)))
+    probes = [(url, {'quiet': True}) for url in candidates]
+    if not probes and probe_playlist_url:
+        probes = [(probe_playlist_url, {'extract_flat': True, 'quiet': True})]
+
+    for url, opts in probes:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                if ydl.extract_info(url, download=False):
+                    return False
+        except Exception as e:
+            logger.debug(f"Rate-limit probe of {url} failed: {type(e).__name__}: {e}")
+    return True
 
 def note_request_result(got_403: bool) -> None:
     """
@@ -533,15 +542,16 @@ def download_playlist(url: str, output_dir: str, tracks: List[Dict[str, str]], m
         logger.error("No tracks found in playlist or failed to extract track information")
         return
 
-    global probe_track_url, probe_playlist_url
+    global probe_track_url, probe_archived_urls, probe_playlist_url
     probe_playlist_url = url
 
     total_tracks = len(tracks)
     archived = load_archive(output_dir)
     pending = [t for t in tracks if t['id'] not in archived]
-    # A track downloaded on an earlier run is known to be accessible; until a track
-    # succeeds in this run, it's the best rate-limit probe
-    probe_track_url = next((t['url'] for t in tracks if t['id'] in archived), None)
+    # Tracks downloaded on earlier runs are probably still accessible; they're the
+    # rate-limit probes until a track succeeds in this run
+    probe_track_url = None
+    probe_archived_urls = [t['url'] for t in tracks if t['id'] in archived]
     already_done = total_tracks - len(pending)
     logger.info(f"Found {total_tracks} tracks in playlist; {already_done} already downloaded (no API call needed), {len(pending)} to process")
     
