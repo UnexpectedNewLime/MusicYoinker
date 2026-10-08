@@ -17,6 +17,7 @@ Date: 17/05/2025
 
 import os
 import sys
+import json
 import logging
 import subprocess
 import argparse
@@ -25,7 +26,7 @@ from typing import Optional, List, Set, Dict, Any, Tuple
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
-from threading import Lock
+from threading import Lock, Event
 
 # Configure logging
 logging.basicConfig(
@@ -40,6 +41,42 @@ MAX_CONCURRENT_DOWNLOADS = multiprocessing.cpu_count() * 2
 # Track which files we're currently downloading to prevent duplicate messages
 downloading_tracks = set()
 downloading_lock = Lock()
+
+# Per-playlist file of already-downloaded track IDs, so re-runs need no per-track API calls
+ARCHIVE_FILENAME = '.downloaded_ids'
+archive_lock = Lock()
+
+# Stop after this many consecutive HTTP 403s: SoundCloud is rate limiting us, and every
+# further request just extends the block. Archived progress lets the next run resume.
+RATE_LIMIT_403_THRESHOLD = 3
+RATE_LIMITED_EXIT_CODE = 3
+consecutive_403s = 0
+rate_limit_lock = Lock()
+rate_limited = Event()
+
+class RateLimitedError(Exception):
+    """Raised when SoundCloud keeps answering with HTTP 403."""
+
+def is_rate_limit_error(e: BaseException) -> bool:
+    return 'HTTP Error 403' in str(e)
+
+def note_request_result(got_403: bool) -> None:
+    """
+    Track consecutive 403s across worker threads and trip the rate-limit flag at the threshold.
+    """
+    global consecutive_403s
+    with rate_limit_lock:
+        if not got_403:
+            consecutive_403s = 0
+            return
+        consecutive_403s += 1
+        if consecutive_403s >= RATE_LIMIT_403_THRESHOLD and not rate_limited.is_set():
+            logger.error(f"Got {consecutive_403s} HTTP 403s in a row; SoundCloud is rate limiting. Stopping remaining downloads.")
+            rate_limited.set()
+
+# Base-dir file mapping playlist URL -> {folder, total} from the last successful fetch,
+# so the runner can order playlists by how much is missing without any API calls
+INDEX_FILENAME = '.playlist_index.json'
 
 def get_existing_songs(directory: str) -> Set[str]:
     """
@@ -143,81 +180,101 @@ def download_progress_hook(d: dict, existing_songs: Set[str], output_dir: str, p
             if progress_callback:
                 progress_callback({'status': 'error', 'current_track': title})
 
-def get_track_info(url: str) -> Optional[Dict[str, Any]]:
+def load_archive(output_dir: str) -> Set[str]:
     """
-    Get track information without downloading.
-    Returns None if track info cannot be retrieved.
+    Load the set of track IDs already downloaded into this directory.
+    Lines use yt-dlp's download-archive format: "soundcloud <track id>".
     """
-    import yt_dlp
-    try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info if info else None
-    except Exception as e:
-        logger.error(f"Failed to get track info: {str(e)}")
-        return None
+    archive_path = os.path.join(output_dir, ARCHIVE_FILENAME)
+    if not os.path.exists(archive_path):
+        return set()
+    with open(archive_path, encoding='utf-8') as f:
+        return {line.strip() for line in f if line.strip()}
 
-def should_skip_track(title: str, existing_songs: Set[str]) -> bool:
+def record_in_archive(output_dir: str, track_id: str) -> None:
     """
-    Check if a track should be skipped based on existing songs.
+    Append a track ID to the directory's archive so later runs skip it without an API call.
     """
-    return title.lower() in existing_songs
+    with archive_lock:
+        with open(os.path.join(output_dir, ARCHIVE_FILENAME), 'a', encoding='utf-8') as f:
+            f.write(f"soundcloud {track_id}\n")
+
+def load_playlist_index(base_dir: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Load the playlist index (URL -> folder name and track count) from the base directory.
+    """
+    index_path = os.path.join(base_dir, INDEX_FILENAME)
+    try:
+        with open(index_path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+def update_playlist_index(base_dir: str, url: str, folder: str, total: int) -> None:
+    """
+    Record a playlist's folder and track count after a successful fetch.
+    """
+    index = load_playlist_index(base_dir)
+    index[url] = {'folder': folder, 'total': total}
+    index_path = os.path.join(base_dir, INDEX_FILENAME)
+    tmp_path = index_path + '.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(index, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, index_path)
+
+def get_missing_percent(url: str, base_dir: str) -> float:
+    """
+    Percentage of a playlist's tracks not yet downloaded, using only local state.
+    Playlists that have never been fetched count as 100% missing.
+    """
+    entry = load_playlist_index(base_dir).get(url)
+    if not entry or not entry.get('total'):
+        return 100.0
+    downloaded = len(load_archive(os.path.join(base_dir, entry['folder'])))
+    return max(0.0, 100.0 * (entry['total'] - downloaded) / entry['total'])
 
 def download_track_by_url(url: str, output_dir: str, ydl_opts: Dict[str, Any]) -> bool:
     """
     Download a single track by URL.
-    Returns True if download was successful, False otherwise.
+    Returns True if download was successful (or skipped by match_filter), False otherwise.
     """
     import yt_dlp
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # Raise on errors (instead of ignoreerrors) so 403s can be detected
+        with yt_dlp.YoutubeDL({**ydl_opts, 'ignoreerrors': False}) as ydl:
             ydl.download([url])
+        note_request_result(got_403=False)
         return True
     except Exception as e:
-        if not str(e).endswith('skipped'):
+        note_request_result(got_403=is_rate_limit_error(e))
+        # yt-dlp has already logged its own DownloadErrors through our logger
+        if not isinstance(e, yt_dlp.utils.DownloadError):
             logger.error(f"Failed to download {url}: {str(e)}")
         return False
 
-def download_single_track(url: str, output_dir: str, existing_songs: Set[str], ydl_opts: Dict[str, Any]) -> bool:
+def download_single_track(track: Dict[str, str], output_dir: str, existing_songs: Set[str], ydl_opts: Dict[str, Any]) -> bool:
     """
     Download a single track from SoundCloud.
     Returns True if download was successful or track already exists, False on error.
-    
-    Can be used independently for single track downloads:
-    ```python
-    # Example usage for single track:
-    url = "https://soundcloud.com/user/track"
-    output_dir = "./downloads"
-    existing_songs = get_existing_songs(output_dir)
-    ydl_opts = get_yt_dlp_options(output_dir)  # Define this function with your preferred options
-    success = download_single_track(url, output_dir, existing_songs, ydl_opts)
-    ```
+
+    The track's metadata is only fetched once, by the download itself. If its title
+    matches a file already in output_dir, match_filter skips the actual download.
+    Either way the track ID is recorded in the archive so future runs skip it for free.
     """
-    # Get track info first
-    info = get_track_info(url)
-    if not info:
+    def skip_if_exists(info: Dict[str, Any], *, incomplete: bool = False) -> Optional[str]:
+        title = info.get('title') or ''
+        if title.lower() in existing_songs:
+            logger.info(f"Skipping existing track: {title}")
+            return f"{title} already exists"
+        return None
+
+    # Don't send any more requests once SoundCloud has started rate limiting
+    if rate_limited.is_set():
         return False
-        
-    title = info.get('title', '')
-    if not title:
-        logger.error("Could not get track title")
-        return False
-        
-    # Check if should skip
-    if should_skip_track(title, existing_songs):
-        logger.info(f"Skipping existing track: {title}")
-        return True
-        
-    # Download the track
-    success = download_track_by_url(url, output_dir, ydl_opts)
-    
-    # Clean up on failure
-    if not success:
-        try:
-            clean_partial_downloads(output_dir, f"{title}.mp3")
-        except Exception as e:
-            logger.debug(f"Failed to clean up fragments: {str(e)}")
-    
+
+    success = download_track_by_url(track['url'], output_dir, {**ydl_opts, 'match_filter': skip_if_exists})
+    if success:
+        record_in_archive(output_dir, track['id'])
     return success
 
 def check_ffmpeg() -> None:
@@ -323,6 +380,7 @@ def extract_playlist_info(url: str, retries: int = 3, backoff_seconds: float = 5
     Fetch playlist metadata (title + flat entries) in a single yt-dlp call,
     retrying with exponential backoff since SoundCloud intermittently
     throttles the playlist-resolve request for large playlists.
+    Raises RateLimitedError if every attempt failed with HTTP 403.
     """
     import time
     import yt_dlp
@@ -332,6 +390,7 @@ def extract_playlist_info(url: str, retries: int = 3, backoff_seconds: float = 5
         'quiet': True,
     }
 
+    last_error = None
     for attempt in range(1, retries + 1):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -340,7 +399,13 @@ def extract_playlist_info(url: str, retries: int = 3, backoff_seconds: float = 5
                     return info
                 logger.warning(f"Playlist extraction returned no data (attempt {attempt}/{retries}), possibly rate limited")
         except Exception as e:
-            logger.warning(f"Failed to extract playlist info (attempt {attempt}/{retries}): {str(e)}")
+            last_error = e
+            logger.warning(f"Failed to extract playlist info (attempt {attempt}/{retries}): {type(e).__name__}: {str(e)}")
+            cause = e.__cause__
+            if cause:
+                logger.warning(f"Underlying cause: {type(cause).__name__}: {str(cause)}")
+            if attempt == retries:
+                logger.exception("Full traceback of final extraction failure:")
 
         if attempt < retries:
             sleep_time = backoff_seconds * (2 ** (attempt - 1))
@@ -348,14 +413,17 @@ def extract_playlist_info(url: str, retries: int = 3, backoff_seconds: float = 5
             time.sleep(sleep_time)
 
     logger.error("Failed to extract playlist info after all retries")
+    if last_error is not None and is_rate_limit_error(last_error):
+        raise RateLimitedError(str(last_error))
     return None
 
-def get_playlist_tracks(info: Dict[str, Any]) -> List[str]:
+def get_playlist_tracks(info: Dict[str, Any]) -> List[Dict[str, str]]:
     """
-    Extract individual track URLs from already-fetched playlist info.
+    Extract individual track IDs and URLs from already-fetched playlist info.
     """
     entries = info.get('entries') or []
-    return [entry['url'] for entry in entries if entry.get('url')]
+    return [{'id': str(entry['id']), 'url': entry['url']}
+            for entry in entries if entry.get('url') and entry.get('id')]
 
 def get_playlist_title(info: Dict[str, Any]) -> str:
     """
@@ -364,9 +432,10 @@ def get_playlist_title(info: Dict[str, Any]) -> str:
     """
     return info.get('title') or 'playlist'
 
-def download_playlist(url: str, output_dir: str, track_urls: List[str], max_concurrent: int = MAX_CONCURRENT_DOWNLOADS, audio_format: str = 'mp3', progress_callback=None) -> None:
+def download_playlist(url: str, output_dir: str, tracks: List[Dict[str, str]], max_concurrent: int = MAX_CONCURRENT_DOWNLOADS, audio_format: str = 'mp3', progress_callback=None) -> None:
     """
     Download a SoundCloud playlist using yt-dlp with concurrent downloads.
+    Raises RateLimitedError if downloads were stopped because of repeated 403s.
     """
     import yt_dlp
 
@@ -374,12 +443,15 @@ def download_playlist(url: str, output_dir: str, track_urls: List[str], max_conc
     existing_songs = get_existing_songs(output_dir)
     logger.info(f"Found {len(existing_songs)} existing songs in the output directory")
 
-    if not track_urls:
+    if not tracks:
         logger.error("No tracks found in playlist or failed to extract track information")
         return
-    
-    total_tracks = len(track_urls)
-    logger.info(f"Found {total_tracks} tracks in playlist")
+
+    total_tracks = len(tracks)
+    archived = load_archive(output_dir)
+    pending = [t for t in tracks if f"soundcloud {t['id']}" not in archived]
+    already_done = total_tracks - len(pending)
+    logger.info(f"Found {total_tracks} tracks in playlist; {already_done} already downloaded (no API call needed), {len(pending)} to process")
     
     if progress_callback:
         progress_callback({
@@ -438,11 +510,11 @@ def download_playlist(url: str, output_dir: str, track_urls: List[str], max_conc
     logger.info(f"Starting concurrent downloads with {max_concurrent} workers")
     logger.info(f"Output format: {audio_format}")
     
-    downloaded = 0
+    downloaded = already_done
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
         future_to_url = {
-            executor.submit(download_single_track, url, output_dir, existing_songs, ydl_opts): url
-            for url in track_urls
+            executor.submit(download_single_track, track, output_dir, existing_songs, ydl_opts): track['url']
+            for track in pending
         }
         
         for future in as_completed(future_to_url):
@@ -465,6 +537,9 @@ def download_playlist(url: str, output_dir: str, track_urls: List[str], max_conc
     # Final cleanup of any remaining fragments
     clean_partial_downloads(output_dir)
 
+    if rate_limited.is_set():
+        raise RateLimitedError(f"Stopped after {RATE_LIMIT_403_THRESHOLD} consecutive HTTP 403s")
+
 def main() -> None:
     """
     Main function to execute the script's primary functionality.
@@ -479,7 +554,17 @@ def main() -> None:
         parser.add_argument('--threads', type=int, help=f'Number of concurrent downloads (default: {MAX_CONCURRENT_DOWNLOADS})')
         parser.add_argument('--format', choices=['mp3', 'opus'], default='mp3', help='Audio format (default: mp3)')
         parser.add_argument('-d', '--cleanup', action='store_true', help='Clean up partial downloads only')
+        parser.add_argument('--missing-percent', action='store_true',
+                            help='Print the percentage of the playlist not yet downloaded (local check, no API calls) and exit')
         args = parser.parse_args()
+
+        # Local-only check used by the runner to order playlists; prints just the number
+        if args.missing_percent:
+            if not args.url or not args.output_dir:
+                parser.print_help()
+                sys.exit(1)
+            print(f"{get_missing_percent(args.url, os.path.abspath(args.output_dir)):.1f}")
+            return
 
         logger.info("Starting script execution")
         
@@ -513,23 +598,26 @@ def main() -> None:
             sys.exit(1)
 
         playlist_title = get_playlist_title(playlist_info)
-        track_urls = get_playlist_tracks(playlist_info)
-        if not track_urls:
+        tracks = get_playlist_tracks(playlist_info)
+        if not tracks:
             logger.error("No tracks found in playlist or failed to extract track information")
             sys.exit(1)
-        logger.info(f"Found {len(track_urls)} tracks in playlist")
 
         safe_title = playlist_title.replace(os.sep, '_').replace(' ', '_')
-        output_dir = os.path.join(validate_directory(args.output_dir), safe_title)
-        output_dir = validate_directory(output_dir)
+        base_dir = validate_directory(args.output_dir)
+        output_dir = validate_directory(os.path.join(base_dir, safe_title))
+        update_playlist_index(base_dir, args.url, safe_title, len(tracks))
 
         # Check for dependencies
         check_ffmpeg()
         check_and_install_yt_dlp()
 
         # Download the playlist
-        download_playlist(args.url, output_dir, track_urls, MAX_CONCURRENT_DOWNLOADS, args.format)
-        
+        download_playlist(args.url, output_dir, tracks, MAX_CONCURRENT_DOWNLOADS, args.format)
+
+    except RateLimitedError as e:
+        logger.error(f"Rate limited by SoundCloud ({e}). Run again later to continue where this left off.")
+        sys.exit(RATE_LIMITED_EXIT_CODE)
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
         sys.exit(1)
