@@ -54,9 +54,11 @@ consecutive_403s = 0
 probing_rate_limit = False
 rate_limit_lock = Lock()
 rate_limited = Event()
-# URL known to have just worked (the playlist being downloaded), used to tell throttling
-# apart from 403s on individual tracks that are simply inaccessible (e.g. private)
-probe_url: Optional[str] = None
+# URLs used to tell throttling apart from 403s on individual tracks that are simply
+# inaccessible (e.g. private): a track known to be accessible (last successful one, or one
+# downloaded on an earlier run), falling back to the playlist itself
+probe_track_url: Optional[str] = None
+probe_playlist_url: Optional[str] = None
 
 class RateLimitedError(Exception):
     """Raised when SoundCloud keeps answering with HTTP 403."""
@@ -66,16 +68,22 @@ def is_rate_limit_error(e: BaseException) -> bool:
 
 def is_throttled() -> bool:
     """
-    Re-request the probe URL once. A 403 there means SoundCloud is throttling us as a whole;
-    success means the preceding 403s were for individual inaccessible tracks.
+    Re-request something known to be accessible. A 403 there means SoundCloud is throttling
+    us as a whole; success means the preceding 403s were for individual inaccessible tracks.
+    Prefers a full (non-flat) extraction of a known-good track, which hits the same track
+    metadata and stream endpoints as a download (minus the media itself); the flat playlist
+    request is only a fallback since it skips those endpoints.
     Any failure to probe is treated as throttling, to err on the side of backing off.
     """
     import yt_dlp
-    if not probe_url:
+    url, opts = probe_track_url, {'quiet': True}
+    if not url:
+        url, opts = probe_playlist_url, {'extract_flat': True, 'quiet': True}
+    if not url:
         return True
     try:
-        with yt_dlp.YoutubeDL({'extract_flat': True, 'quiet': True}) as ydl:
-            return not ydl.extract_info(probe_url, download=False)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return not ydl.extract_info(url, download=False)
     except Exception as e:
         logger.debug(f"Rate-limit probe failed: {type(e).__name__}: {e}")
         return True
@@ -311,6 +319,8 @@ def download_track_by_url(url: str, output_dir: str, ydl_opts: Dict[str, Any]) -
         with yt_dlp.YoutubeDL({**ydl_opts, 'ignoreerrors': False}) as ydl:
             info = ydl.extract_info(url, download=True)
         note_request_result(got_403=False)
+        global probe_track_url
+        probe_track_url = url
         # After post-processing, filepath points at the converted audio file
         downloads = (info or {}).get('requested_downloads') or []
         filepath = downloads[0].get('filepath') if downloads else None
@@ -523,12 +533,15 @@ def download_playlist(url: str, output_dir: str, tracks: List[Dict[str, str]], m
         logger.error("No tracks found in playlist or failed to extract track information")
         return
 
-    global probe_url
-    probe_url = url
+    global probe_track_url, probe_playlist_url
+    probe_playlist_url = url
 
     total_tracks = len(tracks)
     archived = load_archive(output_dir)
     pending = [t for t in tracks if t['id'] not in archived]
+    # A track downloaded on an earlier run is known to be accessible; until a track
+    # succeeds in this run, it's the best rate-limit probe
+    probe_track_url = next((t['url'] for t in tracks if t['id'] in archived), None)
     already_done = total_tracks - len(pending)
     logger.info(f"Found {total_tracks} tracks in playlist; {already_done} already downloaded (no API call needed), {len(pending)} to process")
     
