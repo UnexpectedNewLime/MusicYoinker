@@ -51,8 +51,12 @@ archive_lock = Lock()
 RATE_LIMIT_403_THRESHOLD = 3
 RATE_LIMITED_EXIT_CODE = 3
 consecutive_403s = 0
+probing_rate_limit = False
 rate_limit_lock = Lock()
 rate_limited = Event()
+# URL known to have just worked (the playlist being downloaded), used to tell throttling
+# apart from 403s on individual tracks that are simply inaccessible (e.g. private)
+probe_url: Optional[str] = None
 
 class RateLimitedError(Exception):
     """Raised when SoundCloud keeps answering with HTTP 403."""
@@ -60,19 +64,52 @@ class RateLimitedError(Exception):
 def is_rate_limit_error(e: BaseException) -> bool:
     return 'HTTP Error 403' in str(e)
 
+def is_throttled() -> bool:
+    """
+    Re-request the probe URL once. A 403 there means SoundCloud is throttling us as a whole;
+    success means the preceding 403s were for individual inaccessible tracks.
+    Any failure to probe is treated as throttling, to err on the side of backing off.
+    """
+    import yt_dlp
+    if not probe_url:
+        return True
+    try:
+        with yt_dlp.YoutubeDL({'extract_flat': True, 'quiet': True}) as ydl:
+            return not ydl.extract_info(probe_url, download=False)
+    except Exception as e:
+        logger.debug(f"Rate-limit probe failed: {type(e).__name__}: {e}")
+        return True
+
 def note_request_result(got_403: bool) -> None:
     """
-    Track consecutive 403s across worker threads and trip the rate-limit flag at the threshold.
+    Track consecutive 403s across worker threads. At the threshold, probe once to confirm
+    SoundCloud is throttling before tripping the rate-limit flag.
     """
-    global consecutive_403s
+    global consecutive_403s, probing_rate_limit
     with rate_limit_lock:
         if not got_403:
             consecutive_403s = 0
             return
         consecutive_403s += 1
-        if consecutive_403s >= RATE_LIMIT_403_THRESHOLD and not rate_limited.is_set():
-            logger.error(f"Got {consecutive_403s} HTTP 403s in a row; SoundCloud is rate limiting. Stopping remaining downloads.")
+        if consecutive_403s < RATE_LIMIT_403_THRESHOLD or rate_limited.is_set() or probing_rate_limit:
+            return
+        probing_rate_limit = True
+        count = consecutive_403s
+
+    # Probe outside the lock so other workers aren't blocked on a network request
+    try:
+        throttled = is_throttled()
+    finally:
+        with rate_limit_lock:
+            probing_rate_limit = False
+
+    with rate_limit_lock:
+        if throttled:
+            logger.error(f"Got {count} HTTP 403s in a row and a probe request was also refused; SoundCloud is rate limiting. Stopping remaining downloads.")
             rate_limited.set()
+        else:
+            logger.warning(f"Got {count} HTTP 403s in a row, but a probe request succeeded; treating them as inaccessible tracks and continuing.")
+            consecutive_403s = 0
 
 # Base-dir file mapping playlist URL -> {folder, total} from the last successful fetch,
 # so the runner can order playlists by how much is missing without any API calls
@@ -446,6 +483,9 @@ def download_playlist(url: str, output_dir: str, tracks: List[Dict[str, str]], m
     if not tracks:
         logger.error("No tracks found in playlist or failed to extract track information")
         return
+
+    global probe_url
+    probe_url = url
 
     total_tracks = len(tracks)
     archived = load_archive(output_dir)

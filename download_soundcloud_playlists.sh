@@ -70,7 +70,9 @@ if command -v termux-wake-lock >/dev/null 2>&1; then
 fi
 
 rate_limit_waits=0
+# Number of rate-limit waits in a row after which the next round added nothing
 idle_waits=0
+waited_before_round=0
 i=0
 while (( i < ${#urls_to_process[@]} )); do
   url="${urls_to_process[$i]}"
@@ -99,23 +101,25 @@ while (( i < ${#urls_to_process[@]} )); do
   # Exit code 3 = SoundCloud is rate limiting (repeated HTTP 403s). Moving on would just
   # extend the block, so wait it out and retry this playlist; downloaded tracks are archived
   # so the retry only fetches what's still missing.
-  # Any round that adds tracks resets the idle count, whether or not it hit the rate limit
+  # Any round that adds tracks resets the idle count, whether or not it hit the rate limit;
+  # a round right after a wait that added nothing means that wait didn't help
   new_tracks=$(( $(count_downloaded) - downloaded_before ))
   if (( new_tracks > 0 )); then
     idle_waits=0
+  elif (( waited_before_round )); then
+    idle_waits=$((idle_waits + 1))
   fi
+  waited_before_round=0
 
   if (( exit_code == 3 )); then
-    if (( new_tracks == 0 )); then
-      idle_waits=$((idle_waits + 1))
-    fi
     if (( idle_waits >= MAX_IDLE_WAITS )); then
       echo "Still rate limited after $idle_waits waits with no new downloads. Stopping; run again later to continue."
       break
     fi
     rate_limit_waits=$((rate_limit_waits + 1))
-    echo "Rate limited by SoundCloud while processing $url after $new_tracks new tracks. Waiting ${RATE_LIMIT_WAIT_SECONDS}s before resuming (wait #$rate_limit_waits, $idle_waits/$MAX_IDLE_WAITS idle)..."
+    echo "Rate limited by SoundCloud while processing $url after $new_tracks new tracks. Waiting ${RATE_LIMIT_WAIT_SECONDS}s before resuming (wait #$rate_limit_waits, $idle_waits/$MAX_IDLE_WAITS idle so far)..."
     sleep "$RATE_LIMIT_WAIT_SECONDS"
+    waited_before_round=1
     continue
   fi
 

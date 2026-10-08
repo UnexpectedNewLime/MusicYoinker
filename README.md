@@ -94,7 +94,7 @@ SoundCloud starts returning HTTP 403 after roughly 120 track downloads in a few 
 
 - **Already-downloaded tracks cost no API calls.** Each playlist folder has a `.downloaded_ids` file listing the IDs of tracks already downloaded; those are skipped before any request is made. Tracks you already had before this file existed are matched by title on the first run (one request each) and then recorded.
 - **Most-incomplete playlists go first.** The base directory has a `.playlist_index.json` recording each playlist's folder and track count from its last fetch, so the runner can sort playlists by % still missing without any requests. Playlists that have never been fetched count as 100% missing.
-- **It stops hammering once rate limited.** After 3 HTTP 403s in a row the downloader stops sending requests and exits with code 3.
+- **It stops hammering once rate limited.** After 3 HTTP 403s in a row the downloader re-requests the playlist once to confirm. If that is refused too, SoundCloud is throttling, so it stops sending requests and exits with code 3; if it succeeds, the 403s were for individual inaccessible tracks (e.g. private ones) and it carries on.
 - **It waits and resumes.** On exit code 3 the runner waits `SOUNDCLOUD_RATE_LIMIT_WAIT` seconds (default 5 minutes) and retries the same playlist. It gives up after `SOUNDCLOUD_MAX_IDLE_WAITS` waits in a row that downloaded nothing new; just run it again later to continue.
 - **The phone stays awake.** On Termux the runner holds `termux-wake-lock` while it runs, since waits can stretch a large first download to 30+ minutes.
 
